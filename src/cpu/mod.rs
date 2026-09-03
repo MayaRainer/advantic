@@ -1,9 +1,11 @@
-use crate::{MemoryBus, bit, set_bit};
+use crate::{Bits, System};
 use int_enum::IntEnum;
 
 mod parser;
-use crate::cpu::parser::{DataProcessingCpsr, register_index, spsr_index};
-use parser::{DataProcessingOpcode, HalfwordDataTransferMode, Indexing, Instruction, Offset, OffsetShift};
+use parser::{
+	DataProcessingCpsr, DataProcessingOpcode, HalfwordDataTransferMode, Indexing, Instruction, Offset, OffsetShift,
+	register_index, spsr_index,
+};
 
 mod flags {
 	pub const NEGATIVE: u32 = 31;
@@ -14,7 +16,7 @@ mod flags {
 	pub const THUMB: u32 = 5;
 }
 
-#[derive(Debug, Clone, Copy, IntEnum)]
+#[derive(Debug, Clone, Copy, IntEnum, PartialEq)]
 #[repr(u8)]
 enum CpuMode {
 	User = 0b0000,
@@ -26,18 +28,12 @@ enum CpuMode {
 	System = 0b1111,
 }
 
-fn load_dynamic_width(mem: &mut dyn MemoryBus, address: u32, byte: bool) -> u32 {
-	let value = mem.read(address);
-	if byte { value & 0xff } else { value.rotate_right(8 * (address % 4)) }
-}
-
 pub struct Cpu {
 	registers: [u32; 31],
 	cpsr: u32,
 	spsr: [u32; 5],
-	skip_test: bool,
 	pipeline_size: u8,
-	pub cycle: u16,
+	pub cycle: u32,
 }
 
 impl Cpu {
@@ -46,19 +42,16 @@ impl Cpu {
 	const PC: usize = 15;
 
 	pub fn new() -> Self {
-		let mut registers = [0; _];
-		registers[Self::PC] = 0x0800_0008;
-		registers[register_index(CpuMode::User, Self::SP)] = 0x0300_7F00;
-		registers[register_index(CpuMode::Irq, Self::SP)] = 0x0300_7FA0;
-		registers[register_index(CpuMode::Supervisor, Self::SP)] = 0x0300_7FE0;
-		Self {
-			registers,
-			cpsr: 1 << 4 | CpuMode::System as u32,
+		let mut cpu = Self {
+			registers: [0; _],
+			cpsr: 1 << 4 | CpuMode::Supervisor as u32,
 			spsr: [0; _],
-			pipeline_size: 2,
-			skip_test: false,
+			pipeline_size: 0,
 			cycle: 0,
-		}
+		};
+		cpu.pipeline_load();
+		cpu.pipeline_load();
+		cpu
 	}
 
 	fn instruction_size(&self) -> u32 {
@@ -73,14 +66,19 @@ impl Cpu {
 		self.registers[Self::PC] = value & !(self.instruction_size() - 1);
 		self.pipeline_size = 0;
 		self.cycle();
+		self.cycle();
 	}
 
-	fn cycle(&mut self) {
-		self.cycle = self.cycle.wrapping_add(1);
+	fn pipeline_load(&mut self) {
 		if self.pipeline_size < 2 {
 			self.pipeline_size += 1;
 			self.registers[Self::PC] = self.pc().wrapping_add(self.instruction_size());
 		}
+	}
+
+	fn cycle(&mut self) {
+		self.cycle = self.cycle.wrapping_add(1);
+		self.pipeline_load();
 	}
 
 	fn register(&self, register: usize) -> u32 {
@@ -96,11 +94,15 @@ impl Cpu {
 	}
 
 	fn flag(&self, flag: u32) -> bool {
-		bit(self.cpsr, flag)
+		self.cpsr.bit(flag)
 	}
 
 	fn set_flag(&mut self, bit: u32, value: bool) {
-		self.cpsr = set_bit(self.cpsr, bit, value);
+		self.cpsr.set_bit(bit, value);
+	}
+
+	fn set_mode(&mut self, mode: CpuMode) {
+		self.cpsr = self.cpsr & !0b1111 | mode as u32;
 	}
 
 	fn resolve_indexing(&mut self, index: Indexing, offset: u32) -> u32 {
@@ -155,15 +157,52 @@ impl Cpu {
 		value
 	}
 
-	pub fn step(&mut self, mem: &mut dyn MemoryBus) {
+	fn read(&mut self, sys: &mut System, address: u32) -> u32 {
+		self.cycle();
+		sys.read(address)
+	}
+
+	fn write(&mut self, sys: &mut System, address: u32, register: usize, size: u8) {
+		self.cycle();
+		sys.write(address, self.register(register), size);
+	}
+
+	fn load_dynamic_width(&mut self, sys: &mut System, address: u32, size: u8) -> u32 {
+		let value = self.read(sys, address).rotate_right(8 * (address % 4));
+		value & 1u32.unbounded_shl(u32::from(size) * 8).wrapping_sub(1)
+	}
+
+	pub fn step(&mut self, sys: &mut System) {
+		if !self.flag(flags::DISABLE_IRQ) && sys.read(0x0400_0208) != 0 {
+			let interrupts = sys.interrupts.0;
+			if interrupts & (interrupts >> 16) != 0 {
+				self.spsr[spsr_index(CpuMode::Irq).unwrap()] = self.cpsr;
+				self.set_register(
+					register_index(CpuMode::Irq, Self::LINK),
+					self.pc().wrapping_sub(if self.flag(flags::THUMB) { 0 } else { 4 }),
+				);
+				self.set_flag(flags::THUMB, false);
+				self.set_mode(CpuMode::Irq);
+				self.set_flag(flags::DISABLE_IRQ, true);
+				self.set_pc(0x18);
+				self.cycle();
+				sys.cpu_paused = false;
+			} else if sys.cpu_paused {
+				self.cycle();
+				return;
+			}
+		}
+
 		let mode = CpuMode::try_from((self.cpsr & 0b1111) as u8).expect("invalid CPSR mode");
-		let opcode = mem.read(self.pc().wrapping_sub(u32::from(self.pipeline_size) * self.instruction_size()));
+		let address = self.pc().wrapping_sub(u32::from(self.pipeline_size) * self.instruction_size());
+		let opcode = self.load_dynamic_width(sys, address, self.instruction_size() as u8);
 		let (cond, instruction) = if self.flag(flags::THUMB) {
 			Instruction::parse_thumb(opcode, mode, self.pc())
 		} else {
 			Instruction::parse(opcode, mode)
 		}
 		.expect("invalid instruction");
+
 		let condition = match cond >> 1 {
 			0b000 => self.flag(flags::ZERO),
 			0b001 => self.flag(flags::CARRY),
@@ -176,7 +215,7 @@ impl Cpu {
 		};
 		self.pipeline_size = 1;
 		if u8::from(condition) ^ (cond & 1) == 0 {
-			self.cycle();
+			self.pipeline_load();
 			return;
 		}
 
@@ -187,7 +226,7 @@ impl Cpu {
 					self.pc().wrapping_sub(self.instruction_size()),
 				);
 				self.spsr[spsr_index(CpuMode::Supervisor).unwrap()] = self.cpsr;
-				self.cpsr = self.cpsr & !0b1111 | CpuMode::Supervisor as u32;
+				self.set_mode(CpuMode::Supervisor);
 				self.set_flag(flags::THUMB, false);
 				self.set_flag(flags::DISABLE_IRQ, true);
 				self.set_pc(0x08);
@@ -197,7 +236,7 @@ impl Cpu {
 				if self.flag(flags::THUMB)
 					&& let Some(link_register) = link_register
 				{
-					self.set_pc(self.register(link_register) + offset.cast_unsigned());
+					self.set_pc(self.register(link_register).wrapping_add(offset.cast_unsigned()));
 					self.set_register(link_register, pc - 1);
 				} else {
 					if let Some(link_register) = link_register {
@@ -216,7 +255,7 @@ impl Cpu {
 					&mut self.spsr[spsr]
 				} else {
 					assert!(
-						!bit(mask, flags::THUMB) || self.flag(flags::THUMB) == bit(value, flags::THUMB),
+						!mask.bit(flags::THUMB) || self.flag(flags::THUMB) == value.bit(flags::THUMB),
 						"changing thumb mode during PSR transfer"
 					);
 					&mut self.cpsr
@@ -226,7 +265,7 @@ impl Cpu {
 			Instruction::BlockDataTransfer { load, registers, load_spsr, index } => {
 				let mut address = self.register(index.base);
 
-				let offset = registers.len() as u32 * 4;
+				let offset = if registers.is_empty() { 0x40 } else { registers.len() as u32 * 4 };
 				let updated_base = if index.subtract {
 					address = address.wrapping_sub(offset);
 					address
@@ -236,13 +275,16 @@ impl Cpu {
 				if index.modify_first != index.subtract {
 					address = address.wrapping_add(4);
 				}
-				self.cycle();
+				if load {
+					self.cycle();
+				}
+				let registers = if registers.is_empty() { vec![Self::PC] } else { registers };
 				for register in registers {
 					if load {
-						let value = mem.read(address);
+						let value = self.read(sys, address);
 						self.set_register(register, value);
 					} else {
-						mem.write(address, self.register(register), 4);
+						self.write(sys, address, register, 4);
 					}
 					address = address.wrapping_add(4);
 				}
@@ -253,33 +295,35 @@ impl Cpu {
 					self.cpsr = self.spsr[spsr];
 				}
 			}
-			Instruction::SingleDataTransfer { load, index, target, offset, byte } => {
+			Instruction::SingleDataTransfer { load, index, target, offset, size } => {
 				let offset = self.resolve_offset(offset, false);
 				let address = self.resolve_indexing(index, offset);
-				self.cycle();
 				if load {
-					self.set_register(target, load_dynamic_width(mem, address, byte));
+					self.cycle();
+					let value = self.load_dynamic_width(sys, address, size);
+					self.set_register(target, value);
 				} else {
-					mem.write(address, self.register(target), if byte { 1 } else { 4 });
+					self.write(sys, address, target, size);
 				}
 			}
 			Instruction::HalfwordDataTransfer { mode, index, target, offset } => {
 				let offset = self.resolve_offset(offset, false);
 				let address = self.resolve_indexing(index, offset);
-				self.cycle();
-				if address & 1 != 0 && !matches!(mode, HalfwordDataTransferMode::LoadSignedByte) {
-					self.skip_test = true;
-					//panic!("bit 0 set for halfword load/store");
-				}
+				assert!(
+					address & 1 == 0 || matches!(mode, HalfwordDataTransferMode::LoadSignedByte),
+					"bit 0 set for halfword load/store"
+				);
 				if let HalfwordDataTransferMode::StoreHalfword = mode {
-					let value = self.register(target);
-					mem.write(address, value, 2);
+					self.write(sys, address, target, 2);
 				} else {
+					self.cycle();
 					let value = match mode {
-						HalfwordDataTransferMode::LoadSignedByte => i32::from(mem.read(address) as i8).cast_unsigned(),
-						HalfwordDataTransferMode::LoadUnsignedHalfword => u32::from(mem.read(address) as u16),
+						HalfwordDataTransferMode::LoadSignedByte => {
+							i32::from(self.load_dynamic_width(sys, address, 1) as i8).cast_unsigned()
+						}
+						HalfwordDataTransferMode::LoadUnsignedHalfword => self.load_dynamic_width(sys, address, 2),
 						HalfwordDataTransferMode::LoadSignedHalfword => {
-							i32::from(mem.read(address) as i16).cast_unsigned()
+							i32::from(self.load_dynamic_width(sys, address, 2) as i16).cast_unsigned()
 						}
 						HalfwordDataTransferMode::StoreHalfword => unreachable!(),
 					};
@@ -288,25 +332,33 @@ impl Cpu {
 			}
 			Instruction::BranchAndExchange { register } => {
 				let target = self.register(register);
-				self.set_flag(flags::THUMB, bit(target, 0));
+				self.set_flag(flags::THUMB, target.bit(0));
 				self.set_pc(target);
 			}
-			Instruction::SingleDataSwap { source, target, base, byte } => {
+			Instruction::SingleDataSwap { source, target, base, size } => {
 				let address = self.register(base);
-				let value = load_dynamic_width(mem, address, byte);
-				mem.write(address, self.register(source), if byte { 1 } else { 4 });
+				self.cycle();
+				let value = self.load_dynamic_width(sys, address, size);
+				self.write(sys, address, source, size);
 				self.set_register(target, value);
 			}
 			Instruction::Multiply { operand1, operand2, accumulate, target, set_flags } => {
-				let mut result = self.register(operand1).wrapping_mul(self.register(operand2));
+				let operand1 = self.register(operand1);
+				let operand2 = self.register(operand2);
+				let mut result = operand1.wrapping_mul(operand2);
 				if let Some(accumulate) = accumulate {
 					result = result.wrapping_add(self.register(accumulate));
+					self.cycle();
 				}
 				if set_flags {
 					self.set_flag(flags::ZERO, result == 0);
-					self.set_flag(flags::NEGATIVE, bit(result, 31));
+					self.set_flag(flags::NEGATIVE, result.bit(31));
 				}
 				self.set_register(target, result);
+				let cycles = (4 - operand2.leading_ones().max(operand2.leading_zeros()) / 8).min(1);
+				for _ in 0..cycles {
+					self.cycle();
+				}
 			}
 			Instruction::MultiplyLong {
 				operand1,
@@ -320,25 +372,32 @@ impl Cpu {
 				let operand1 = self.register(operand1);
 				let operand2 = self.register(operand2);
 				let accumulate = if accumulate {
+					self.cycle();
 					(u64::from(self.register(target_high)) << 32) | u64::from(self.register(target_low))
 				} else {
 					0
 				};
-				let result = if signed {
-					i64::from(operand1.cast_signed())
+				let (result, complexity) = if signed {
+					let result = i64::from(operand1.cast_signed())
 						.wrapping_mul(i64::from(operand2.cast_signed()))
 						.wrapping_add(accumulate.cast_signed())
-						.cast_unsigned()
+						.cast_unsigned();
+					(result, operand2.leading_ones().max(operand2.leading_zeros()))
 				} else {
-					(u64::from(operand1) * u64::from(operand2)).wrapping_add(accumulate)
+					let result = (u64::from(operand1) * u64::from(operand2)).wrapping_add(accumulate);
+					(result, operand2.leading_zeros())
 				};
 				let (low, high) = (result as u32, (result >> 32) as u32);
 				if set_flags {
 					self.set_flag(flags::ZERO, high == 0 && low == 0);
-					self.set_flag(flags::NEGATIVE, bit(high, 31));
+					self.set_flag(flags::NEGATIVE, high.bit(31));
 				}
 				self.set_register(target_low, low);
 				self.set_register(target_high, high);
+				let cycles = (4 - complexity / 8).min(1);
+				for _ in 0..cycles {
+					self.cycle();
+				}
 			}
 			Instruction::DataProcessing { cpsr, opcode, operand1, operand2, target } => {
 				let old_carry = self.flag(flags::CARRY);
@@ -373,6 +432,16 @@ impl Cpu {
 						}
 					}
 				}
+				match cpsr {
+					DataProcessingCpsr::SetFlags => {
+						self.set_flag(flags::NEGATIVE, result.bit(31));
+						self.set_flag(flags::ZERO, result == 0);
+					}
+					DataProcessingCpsr::LoadSpsr(spsr) => {
+						self.cpsr = self.spsr[spsr];
+					}
+					DataProcessingCpsr::Unchanged => {}
+				}
 				if !matches!(
 					opcode,
 					DataProcessingOpcode::TestAdd
@@ -382,176 +451,8 @@ impl Cpu {
 				) {
 					self.set_register(target, result);
 				}
-				match cpsr {
-					DataProcessingCpsr::SetFlags => {
-						self.set_flag(flags::NEGATIVE, bit(result, 31));
-						self.set_flag(flags::ZERO, result == 0);
-					}
-					DataProcessingCpsr::LoadSpsr(spsr) => self.cpsr = self.spsr[spsr],
-					DataProcessingCpsr::Unchanged => {}
-				}
 			}
 		}
-		self.cycle();
-	}
-}
-
-#[test]
-fn test() {
-	use std::cell::RefCell;
-	use std::collections::{HashMap, VecDeque};
-
-	#[derive(Debug)]
-	enum Transaction {
-		Read { address: u32, value: u32 },
-		Write { address: u32, value: u32 },
-	}
-	struct TestMemoryBus {
-		transactions: RefCell<VecDeque<Transaction>>,
-	}
-	impl MemoryBus for TestMemoryBus {
-		fn read(&self, address: u32) -> u32 {
-			let transaction = self.transactions.borrow_mut().pop_front().unwrap();
-			if let Transaction::Read { address: a, value } = transaction {
-				assert_eq!(address, a, "read address");
-				value
-			} else {
-				panic!("expected read {address}")
-			}
-		}
-
-		fn write(&mut self, address: u32, value: u32, size: u8) {
-			let value = value & u32::MAX >> ((4 - size) * 8);
-			let transaction = self.transactions.borrow_mut().pop_front().unwrap();
-			if let Transaction::Write { address: a, value: v } = transaction {
-				assert_eq!(address, a, "write address");
-				assert_eq!(value, v, "write value {address}");
-			} else {
-				panic!("expected write {address}")
-			}
-		}
-	}
-	struct TestData {
-		data: Vec<u8>,
-		offset: usize,
-	}
-	impl TestData {
-		fn next_u32(&mut self) -> u32 {
-			let data = u32::from_le_bytes(self.data[self.offset..(self.offset + 4)].try_into().unwrap());
-			self.offset += 4;
-			data
-		}
-	}
-
-	for (file_index, file) in std::fs::read_dir("v1").unwrap().enumerate() {
-		let mut errors = HashMap::<String, u16>::new();
-		let file = file.unwrap();
-		println!("{}", file.path().display());
-		let data = std::fs::read(file.path()).unwrap();
-		let mut data = TestData { data, offset: 4 };
-		let count = data.next_u32();
-
-		for index in 0..count {
-			let end = data.offset + data.next_u32() as usize;
-			data.offset += 8;
-
-			let registers = std::array::from_fn(|_| data.next_u32());
-			let cpsr = data.next_u32();
-			let spsr = std::array::from_fn(|_| data.next_u32());
-			data.offset += 4 * 3 + 8;
-
-			let mut final_registers: [_; 31] = std::array::from_fn(|_| data.next_u32());
-			let mut final_cpsr = data.next_u32();
-			let final_spsr: [_; 5] = std::array::from_fn(|_| data.next_u32());
-			data.offset += 4 * 3 + 8;
-			let mut cpu = Cpu { registers, cpsr, spsr, pipeline_size: 2, skip_test: false, cycle: 0 };
-			let mode = CpuMode::try_from((cpsr & 0b1111) as u8).expect("invalid CPSR mode");
-
-			let mut transactions: VecDeque<_> = (0..data.next_u32())
-				.filter_map(|_| {
-					let kind = data.next_u32();
-					let _size = data.next_u32();
-					let address = data.next_u32();
-					let value = data.next_u32();
-					data.offset += 8;
-					if kind == 0 {
-						return None;
-					}
-					Some(if kind == 2 {
-						Transaction::Write { address, value }
-					} else {
-						Transaction::Read { address, value }
-					})
-				})
-				.collect();
-			data.offset += 8;
-			let opcode = data.next_u32();
-			let address = data.next_u32();
-			data.offset = end;
-
-			let (shifted_opcode, instruction) = if cpu.flag(flags::THUMB) {
-				let opcode = opcode << if address.is_multiple_of(4) { 0 } else { 16 };
-				(opcode, Instruction::parse_thumb(opcode, mode, address))
-			} else {
-				(opcode, Instruction::parse(opcode, mode))
-			};
-			transactions.push_front(Transaction::Read { address, value: shifted_opcode });
-			let instruction = match instruction {
-				Ok(parsed) => parsed,
-				Err(err) => {
-					*errors.entry(err.to_string()).or_default() += 1;
-					continue;
-				}
-			};
-
-			if matches!(instruction.1, Instruction::Multiply { .. } | Instruction::MultiplyLong { .. }) {
-				final_cpsr = set_bit(final_cpsr, flags::CARRY, bit(cpsr, flags::CARRY));
-			}
-
-			if let (_, Instruction::StorePsr { spsr, source, .. }) = instruction
-				&& let Offset::ShiftedRegister { register, .. } = source
-				&& spsr.is_none()
-			{
-				let mask = 1 << 4;
-				cpu.registers[register] |= final_cpsr & mask;
-				final_registers[register] |= final_cpsr & mask;
-
-				cpu.registers[register] = set_bit(cpu.registers[register], flags::THUMB, bit(cpsr, flags::THUMB));
-				final_registers[register] = set_bit(final_registers[register], flags::THUMB, bit(cpsr, flags::THUMB));
-				final_cpsr = set_bit(final_cpsr, flags::THUMB, bit(cpsr, flags::THUMB));
-			}
-
-			if file_index == 17 {
-				dbg!(index);
-				if cpu.flag(flags::THUMB) {
-					println!("instruction {opcode:016b}");
-				} else {
-					println!("instruction {opcode:032b}");
-				}
-				dbg!(instruction);
-				println!("cpsr {cpsr:032b} {final_cpsr:032b}");
-			}
-			let mut mem = TestMemoryBus { transactions: RefCell::new(transactions) };
-			cpu.step(&mut mem);
-
-			if cpu.skip_test {
-				continue;
-			}
-			assert!(mem.transactions.take().is_empty());
-			for (i, value) in cpu.registers.iter().enumerate() {
-				let mut expected = final_registers[i];
-				if i == Cpu::PC {
-					expected &= !(cpu.instruction_size() - 1);
-				}
-				assert_eq!(*value, expected, "registers[{i}] {file_index} {index}");
-			}
-			assert_eq!(cpu.cpsr, final_cpsr, "cpsr {:032b} {:032b} {}", cpu.cpsr, final_cpsr, index);
-			for (i, value) in cpu.spsr.iter().enumerate() {
-				assert_eq!(*value, final_spsr[i], "spsr[{i}]");
-			}
-		}
-		for (error, count) in errors {
-			eprintln!("{error}: {count}");
-		}
+		self.pipeline_load();
 	}
 }

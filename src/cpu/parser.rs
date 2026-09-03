@@ -1,4 +1,4 @@
-use crate::cpu::{Cpu, CpuMode, bit};
+use crate::cpu::{Cpu, CpuMode, Bits};
 use int_enum::IntEnum;
 
 pub fn register_index(mode: CpuMode, register: u32) -> usize {
@@ -31,9 +31,9 @@ pub struct Indexing {
 impl Indexing {
 	fn parse(mode: CpuMode, instruction: u32) -> Result<Self, &'static str> {
 		let parsed = Self {
-			write_back: bit(instruction, 21),
-			subtract: !bit(instruction, 23),
-			modify_first: bit(instruction, 24),
+			write_back: instruction.bit(21),
+			subtract: !instruction.bit(23),
+			modify_first: instruction.bit(24),
 			base: register_index(mode, instruction >> 16),
 		};
 		if parsed.base == Cpu::PC && (parsed.write_back || !parsed.modify_first) {
@@ -69,7 +69,7 @@ impl Offset {
 		Self::ShiftedRegister {
 			register: register_index(mode, instruction),
 			shift_type,
-			shift: if bit(instruction, 4) {
+			shift: if instruction.bit(4) {
 				OffsetShift::Register(register_index(mode, instruction >> 8))
 			} else {
 				OffsetShift::parse_immediate(instruction >> 7, shift_type)
@@ -78,10 +78,10 @@ impl Offset {
 	}
 
 	fn parse_data_processing(instruction: u32, mode: CpuMode) -> Self {
-		if bit(instruction, 25) {
+		if instruction.bit(25) {
 			let rotate = ((instruction >> 8) & 0b1111) * 2;
 			let value = (instruction & 0xff).rotate_right(rotate);
-			Self::Immediate { value, carry: if rotate != 0 { Some(bit(value, 31)) } else { None } }
+			Self::Immediate { value, carry: if rotate != 0 { Some(value.bit(31)) } else { None } }
 		} else {
 			Self::parse_shifted_register(instruction, mode)
 		}
@@ -148,7 +148,7 @@ pub enum Instruction {
 		index: Indexing,
 		target: usize,
 		offset: Offset,
-		byte: bool,
+		size: u8,
 	},
 	HalfwordDataTransfer {
 		mode: HalfwordDataTransferMode,
@@ -163,7 +163,7 @@ pub enum Instruction {
 		source: usize,
 		target: usize,
 		base: usize,
-		byte: bool,
+		size: u8,
 	},
 	MultiplyLong {
 		operand1: usize,
@@ -206,16 +206,13 @@ fn thumb_register(instruction: u32, bit: u32, mode: CpuMode) -> usize {
 fn parse_register_list(mode: CpuMode, instruction: u32, index: &Indexing) -> Result<Vec<usize>, &'static str> {
 	let mut registers: Vec<usize> = Vec::new();
 	for i in 0..16 {
-		if bit(instruction, i) {
+		if instruction.bit(i) {
 			let register = register_index(mode, i);
 			if index.write_back && register == index.base {
 				return Err("base included in Rlist with write-back enabled");
 			}
 			registers.push(register);
 		}
-	}
-	if registers.is_empty() {
-		return Err("Rlist empty");
 	}
 	Ok(registers)
 }
@@ -234,19 +231,19 @@ pub fn spsr_index(mode: CpuMode) -> Result<usize, &'static str> {
 impl Instruction {
 	pub fn parse(instruction: u32, mode: CpuMode) -> Result<(u8, Self), &'static str> {
 		let parsed = match (instruction >> 25) & 0b111 {
-			0b111 if bit(instruction, 24) => Self::Interrupt,
+			0b111 if instruction.bit(24) => Self::Interrupt,
 			0b110 | 0b111 => return Err("coprocessor"),
 			0b101 => Self::Branch {
 				offset: ((instruction & 0x00ff_ffff) << 8).cast_signed() >> 6,
-				link_register: if bit(instruction, 24) { Some(register_index(mode, Cpu::LINK)) } else { None },
+				link_register: if instruction.bit(24) { Some(register_index(mode, Cpu::LINK)) } else { None },
 			},
 			0b100 => {
-				let load = bit(instruction, 20);
+				let load = instruction.bit(20);
 				let mut load_spsr = None;
 				let index = Indexing::parse(mode, instruction)?;
 				let mut mode = mode;
-				if bit(instruction, 22) {
-					if load && bit(instruction, Cpu::PC as u32) {
+				if instruction.bit(22) {
+					if load && instruction.bit(Cpu::PC as u32) {
 						load_spsr = Some(spsr_index(mode)?);
 					} else {
 						mode = CpuMode::User;
@@ -266,7 +263,7 @@ impl Instruction {
 					load_spsr,
 				}
 			}
-			0b011 if bit(instruction, 4) => return Err("undefined"),
+			0b011 if instruction.bit(4) => return Err("undefined"),
 			0b010 | 0b011 => {
 				let index = Indexing::parse(mode, instruction)?;
 				let target = register_index(mode, instruction >> 12);
@@ -274,11 +271,11 @@ impl Instruction {
 					return Err("Rn = Rm with write-back in single data transfer");
 				}
 				Self::SingleDataTransfer {
-					load: bit(instruction, 20),
+					load: instruction.bit(20),
 					index,
 					target,
-					byte: bit(instruction, 22),
-					offset: if bit(instruction, 25) {
+					size: if instruction.bit(22) { 1 } else { 4 },
+					offset: if instruction.bit(25) {
 						Offset::parse_shifted_register(instruction, mode)
 					} else {
 						Offset::Immediate { value: instruction & 0xfff, carry: None }
@@ -286,7 +283,7 @@ impl Instruction {
 				}
 			}
 			_ => {
-				if !bit(instruction, 25) && (instruction >> 4) & 0b1001 == 0b1001 {
+				if !instruction.bit(25) && (instruction >> 4) & 0b1001 == 0b1001 {
 					if instruction & (0b11 << 5) != 0 {
 						let index = Indexing::parse(mode, instruction)?;
 						let target = register_index(mode, instruction >> 12);
@@ -294,7 +291,7 @@ impl Instruction {
 							return Err("Rn = Rm with write-back in halfword data transfer");
 						}
 						Self::HalfwordDataTransfer {
-							mode: if bit(instruction, 20) {
+							mode: if instruction.bit(20) {
 								match (instruction >> 5) & 0b11 {
 									0b01 => HalfwordDataTransferMode::LoadUnsignedHalfword,
 									0b10 => HalfwordDataTransferMode::LoadSignedByte,
@@ -304,7 +301,7 @@ impl Instruction {
 							} else {
 								HalfwordDataTransferMode::StoreHalfword
 							},
-							offset: if bit(instruction, 22) {
+							offset: if instruction.bit(22) {
 								Offset::Immediate { value: (instruction >> 4) & 0xf0 | instruction & 0xf, carry: None }
 							} else {
 								Offset::Register(register_index(mode, instruction))
@@ -324,24 +321,24 @@ impl Instruction {
 							0b00 => Self::Multiply {
 								operand1,
 								operand2,
-								accumulate: if bit(instruction, 21) { Some(operand3) } else { None },
+								accumulate: if instruction.bit(21) { Some(operand3) } else { None },
 								target: operand4,
-								set_flags: bit(instruction, 20),
+								set_flags: instruction.bit(20),
 							},
 							0b01 => Self::MultiplyLong {
 								operand1,
 								operand2,
-								accumulate: bit(instruction, 21),
-								signed: bit(instruction, 22),
+								accumulate: instruction.bit(21),
+								signed: instruction.bit(22),
 								target_low: operand3,
 								target_high: operand4,
-								set_flags: bit(instruction, 20),
+								set_flags: instruction.bit(20),
 							},
 							0b10 => Self::SingleDataSwap {
 								source: operand1,
 								target: operand3,
 								base: operand4,
-								byte: bit(instruction, 22),
+								size: if instruction.bit(22) { 1 } else { 4 },
 							},
 							_ => return Err("invalid instruction"),
 						}
@@ -352,9 +349,9 @@ impl Instruction {
 						return Err("R15 used as operand for BX");
 					}
 					Self::BranchAndExchange { register }
-				} else if !bit(instruction, 20) && instruction >> 23 & 0b11 == 0b10 {
-					let spsr = if bit(instruction, 22) { Some(spsr_index(mode)?) } else { None };
-					if bit(instruction, 21) {
+				} else if !instruction.bit(20) && instruction >> 23 & 0b11 == 0b10 {
+					let spsr = if instruction.bit(22) { Some(spsr_index(mode)?) } else { None };
+					if instruction.bit(21) {
 						let mut fields = (instruction >> 16) & 0b1111;
 						if matches!(mode, CpuMode::User) {
 							fields &= 0b1000;
@@ -367,7 +364,7 @@ impl Instruction {
 						}
 						Self::StorePsr {
 							spsr,
-							mask: (0..4).fold(0, |acc, i| if bit(fields, i) { acc | 0xff << (i * 8) } else { acc }),
+							mask: (0..4).fold(0, |acc, i| if fields.bit(i) { acc | 0xff << (i * 8) } else { acc }),
 							source,
 						}
 					} else {
@@ -379,7 +376,7 @@ impl Instruction {
 					}
 				} else {
 					let target = register_index(mode, instruction >> 12);
-					let set_flags = bit(instruction, 20);
+					let set_flags = instruction.bit(20);
 					Self::DataProcessing {
 						operand1: register_index(mode, instruction >> 16),
 						operand2: Offset::parse_data_processing(instruction, mode),
@@ -402,11 +399,10 @@ impl Instruction {
 	}
 
 	pub fn parse_thumb(instruction: u32, mode: CpuMode, address: u32) -> Result<(u8, Self), &'static str> {
-		let instruction = instruction >> if address.is_multiple_of(4) { 0 } else { 16 };
 		let mut cond = 0b1110;
 		let instruction = match (instruction >> 12) & 0b1111 {
 			0b1111 => {
-				if bit(instruction, 11) {
+				if instruction.bit(11) {
 					Instruction::Branch {
 						offset: (instruction & 0x7ff).cast_signed() << 1,
 						link_register: Some(register_index(mode, Cpu::LINK)),
@@ -443,14 +439,14 @@ impl Instruction {
 					Indexing { base: thumb_register(instruction, 8, mode), write_back: true, ..Indexing::default() };
 				Self::BlockDataTransfer {
 					registers: parse_register_list(mode, instruction & 0xff, &index)?,
-					load: bit(instruction, 11),
+					load: instruction.bit(11),
 					index,
 					load_spsr: None,
 				}
 			}
 			0b1011 => {
-				if bit(instruction, 10) {
-					let load = bit(instruction, 11);
+				if instruction.bit(10) {
+					let load = instruction.bit(11);
 					let index = Indexing {
 						base: register_index(mode, Cpu::SP),
 						subtract: !load,
@@ -458,7 +454,7 @@ impl Instruction {
 						write_back: true,
 					};
 					let mut registers = parse_register_list(mode, instruction & 0xff, &index)?;
-					if bit(instruction, 8) {
+					if instruction.bit(8) {
 						registers.push(if load { Cpu::PC } else { register_index(mode, Cpu::LINK) });
 					}
 					Self::BlockDataTransfer { registers, load, index, load_spsr: None }
@@ -467,7 +463,7 @@ impl Instruction {
 					Self::DataProcessing {
 						cpsr: DataProcessingCpsr::Unchanged,
 						target: sp,
-						opcode: if bit(instruction, 7) {
+						opcode: if instruction.bit(7) {
 							DataProcessingOpcode::Subtract
 						} else {
 							DataProcessingOpcode::Add
@@ -478,7 +474,7 @@ impl Instruction {
 				}
 			}
 			0b1010 => {
-				let use_sp = bit(instruction, 11);
+				let use_sp = instruction.bit(11);
 				Self::DataProcessing {
 					cpsr: DataProcessingCpsr::Unchanged,
 					target: thumb_register(instruction, 8, mode),
@@ -494,8 +490,8 @@ impl Instruction {
 				target: thumb_register(instruction, 8, mode),
 				index: Indexing { base: register_index(mode, Cpu::SP), modify_first: true, ..Indexing::default() },
 				offset: Offset::Immediate { value: (instruction & 0xff) << 2, carry: None },
-				load: bit(instruction, 11),
-				byte: false,
+				load: instruction.bit(11),
+				size: 4,
 			},
 			0b1000 => Self::HalfwordDataTransfer {
 				target: thumb_register(instruction, 0, mode),
@@ -504,7 +500,7 @@ impl Instruction {
 					modify_first: true,
 					..Indexing::default()
 				},
-				mode: if bit(instruction, 11) {
+				mode: if instruction.bit(11) {
 					HalfwordDataTransferMode::LoadUnsignedHalfword
 				} else {
 					HalfwordDataTransferMode::StoreHalfword
@@ -512,7 +508,7 @@ impl Instruction {
 				offset: Offset::Immediate { value: (instruction >> 5) & 0b11_1110, carry: None },
 			},
 			0b0110..=0b0111 => {
-				let byte = bit(instruction, 12);
+				let size = if instruction.bit(12) { 1 } else { 4 };
 				let offset = (instruction >> 6) & 0b11111;
 				Self::SingleDataTransfer {
 					target: thumb_register(instruction, 0, mode),
@@ -521,9 +517,9 @@ impl Instruction {
 						modify_first: true,
 						..Indexing::default()
 					},
-					offset: Offset::Immediate { value: offset << if byte { 0 } else { 2 }, carry: None },
-					load: bit(instruction, 11),
-					byte,
+					offset: Offset::Immediate { value: offset << (size >> 1), carry: None },
+					load: instruction.bit(11),
+					size,
 				}
 			}
 			0b0101 => {
@@ -531,7 +527,7 @@ impl Instruction {
 					Indexing { base: thumb_register(instruction, 3, mode), modify_first: true, ..Indexing::default() };
 				let target = thumb_register(instruction, 0, mode);
 				let offset = Offset::Register(thumb_register(instruction, 6, mode));
-				if bit(instruction, 9) {
+				if instruction.bit(9) {
 					Self::HalfwordDataTransfer {
 						target,
 						index,
@@ -549,8 +545,8 @@ impl Instruction {
 						target,
 						index,
 						offset,
-						load: bit(instruction, 11),
-						byte: bit(instruction, 10),
+						load: instruction.bit(11),
+						size: if instruction.bit(10) { 1 } else { 4 },
 					}
 				}
 			}
@@ -567,7 +563,7 @@ impl Instruction {
 						carry: None,
 					},
 					load: true,
-					byte: false,
+					size: 4,
 				},
 				0b01 => {
 					let operation = (instruction >> 8) & 0b11;
@@ -660,13 +656,13 @@ impl Instruction {
 					Self::DataProcessing {
 						cpsr: DataProcessingCpsr::SetFlags,
 						target: thumb_register(instruction, 0, mode),
-						opcode: if bit(instruction, 9) {
+						opcode: if instruction.bit(9) {
 							DataProcessingOpcode::Subtract
 						} else {
 							DataProcessingOpcode::Add
 						},
 						operand1: thumb_register(instruction, 3, mode),
-						operand2: if bit(instruction, 10) {
+						operand2: if instruction.bit(10) {
 							Offset::Immediate { value: (instruction >> 6) & 0b111, carry: None }
 						} else {
 							Offset::Register(thumb_register(instruction, 6, mode))

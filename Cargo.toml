@@ -5,9 +5,14 @@ edition = "2024"
 
 [dependencies]
 int-enum = "1.2.0"
+sdl2 = { version = "0.38.0", features = ["unsafe_textures"] }
 
 [profile.dev]
 opt-level = 1
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true
 
 [profile.dev.package."*"]
 opt-level = 3
